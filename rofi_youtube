@@ -1,0 +1,204 @@
+#!/bin/sh
+
+useragent=${useragent-'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.152 Safari/537.36'}
+tab_space=$(printf '\t')
+mpv_args="-shuffle --ytdl-raw-options=sub-lang=en,write-auto-sub=,yes-playlist= --force-window=immediate"
+menu_command="rofi -dmenu -i -fuzzy -width 1500 -p \"YouTube ❯\""
+new_line="
+"
+
+function_exists () {
+        type "$1" > /dev/null 2>&1 && return 0 || return 1
+}
+
+if ! function_exists 'video_info_text'; then
+        video_info_text () {
+                printf "%s" "$title"
+                printf "%-${title_len}.${title_len}s\t" "$title"
+                printf "%-${channel_len}.${channel_len}s\t" "$channel"
+                printf "%-${dur_len}.${dur_len}s\t" "$duration"
+                printf "%-${view_len}.${view_len}s\t" "$views"
+                printf "%-${date_len}.${date_len}s\t" "$date"
+                printf "%s" "$shorturl"
+                printf "\n"
+        }
+fi
+
+format_video_data () {
+        while IFS=$tab_space read -r title channel views duration date shorturl; do
+            video_info_text
+        done << EOF
+        $*
+EOF
+        unset title channel duration views date shorturl
+}
+
+video_menu () {
+        #take input format it to the appropriate format, then pipe it into the menu
+        format_video_data "$*" |  eval "$menu_command"
+}
+
+get_video_data () {
+        # outputs tab and pipe separated fields: title, channel, view count, video length, video upload date, and the video id/url
+        # from the videos_json
+        printf "%s" "$*" |\
+            jq -r '.[]| "\(.title)'"$tab_space"'|\(.channel)'"$tab_space"'|\(.views)'"$tab_space"'|\(.duration)'"$tab_space"'|\(.date)'"$tab_space"'|\(.videoID)"'
+}
+
+get_yt_json () {
+        # scrapes the json embedded in the youtube html page
+        printf "%s" "$*" | sed -n '/var *ytInitialData/,$p' | tr -d '\n' |\
+        sed -E ' s_^.*var ytInitialData ?=__ ; s_;</script>.*__ ;'
+}
+
+get_yt_html () {
+    link=$1
+    query=$2
+    printf "%s" "$(
+        curl "$link" -s \
+          -G --data-urlencode "search_query=$query" \
+          -G --data-urlencode "sp=$sp" \
+          -H 'Authority: www.youtube.com' \
+          -H "User-Agent: $useragent" \
+          -H 'Accept-Language: en-US,en;q=0.9' \
+          -L \
+          --compressed
+    )"
+    unset link query
+}
+
+scrape_youtube () {
+        yt_html=$(get_yt_html "https://www.youtube.com/results" "$*")
+
+        if [ -z "$yt_html" ]; then
+                print_error "ERROR[#01]: Couldn't curl website. Please check your network and try again.\n"
+                exit 1
+        fi
+
+        yt_json=$(get_yt_json "$yt_html")
+
+        #if the data couldn't be found
+        if [ -z "$yt_json" ]; then
+                print_error "ERROR[#02]: Couldn't find data on site.\n"
+                exit 1
+        fi
+
+        #gets a list of videos
+        videos_json=$(printf "%s" "$yt_json" | jq '[ .contents|
+        ..|.videoRenderer? |
+        select(. !=null) |
+                {
+                        title: .title.runs[0].text,
+                        channel: .longBylineText.runs[0].text,
+                        duration:.lengthText.simpleText,
+                        views: .shortViewCountText.simpleText,
+                        date: .publishedTimeText.simpleText,
+                        description: .detailedMetadataSnippets[0].snippetText.runs[0].text,
+                        videoID: .videoId,
+                        thumbs: .thumbnail.thumbnails[0].url
+                }
+        ]')
+
+        playlist_json=$(printf "%s" "$yt_json" | jq '[ .contents|
+        ..|.playlistRenderer? |
+        select(. !=null) |
+                {
+                        title: "[Playlist] \(.title.simpleText)",
+                        channel: .longBylineText.runs[0].text,
+                        duration: "\(.videoCount) videos",
+                        views: "playlist",
+                        date: "playlist",
+                        videoID: .playlistId,
+                        thumbs: .thumbnails[0].thumbnails[0].url
+                }
+        ]')
+
+        videos_json=$playlist_json$videos_json
+        #printf "%s" "$videos_json" > "$tmp_video_json_file"
+        printf "%s" "$videos_json" > videos_json.json
+
+        #checks if it's empty in case it was defined in a config function eg: on_get_search
+        [ -z "$videos_data" ] && videos_data=$(get_video_data "$videos_json")
+        #if there aren't videos
+        if [ -z "$videos_data" ]; then
+            printf "No results found. Try different keywords.\n" >&2
+            exit 1
+        fi
+        unset playlist_json yt_json yt_html
+}
+
+get_playlists() {
+    while read -r LINE
+    do 
+        name_title="$(echo $LINE | gawk -F\| '{print($1)}')"
+        echo $name_title
+    done < "$videos_data"
+}
+
+choice_selection () {
+
+    # Get choice from rofi
+    selected_data=$( video_menu "$videos_data")
+
+}
+
+format_data () {
+        #for each url append the full url to the $urls string
+        #through this loop, the selected data which was truncated by formatting is retrived.
+        selected_key="${selected_data%%${new_line}*}"
+        selected_urls=
+        while read data_line; do
+                surl=${data_line##*|}
+                [ -z "$surl" ] && continue # to ignore the separators
+                #literally just check if there is :// to make sure it's a url (just in case the url doesn't use https or http)
+                #peertube urls can differ a lot
+                case ${#surl} in
+                                        # youtube video
+                        11) selected_urls=$selected_urls$new_line'https://www.youtube.com/watch?v='$surl ;;
+                        34) selected_urls=$selected_urls$new_line'https://www.youtube.com/playlist?list='$surl ;;
+                        36)
+                            selected_urls=$selected_urls$new_line"$(printf "%s" "$videos_json" | jq '.[].url' | grep -F "$surl" | tr -d '"')" ;;
+                        *) continue ;;
+                esac
+                refined_selected_data=$refined_selected_data$new_line$(printf '%s' "$videos_data" | grep "|$surl" )
+        done << EOF
+        $selected_data
+EOF
+
+        selected_urls=${selected_urls#$new_line}
+        [ -z "$selected_urls" ] && exit # exit if no valid url
+
+        #sometimes % shows up in selected data, could throw an error if it's an invalid directive
+        selected_data=${refined_selected_data#$new_line}
+        unset shorturls refined_selected_data
+}
+
+print_info () {
+    printf "$*"
+}
+
+main() {
+
+  # Grab the search query from user
+  search_query=$(eval "$menu_command")
+
+  # Get the required data using curl
+  scrape_youtube "$search_query"
+
+  # Display the data through rofi and capture the selected video option 
+  choice_selection
+
+  # Format the video data and extract the youtube link
+  format_data
+
+  # Send notification
+  notify-send "YouTube - Loading:" "$choice"
+
+  # Spawn mpv
+  mpv $mpv_args "$selected_urls" 2>/dev/null 1>/dev/null
+}
+
+main &
+
+exit 0
+
